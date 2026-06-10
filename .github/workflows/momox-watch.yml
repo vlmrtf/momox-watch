@@ -1,0 +1,51 @@
+name: Surveillance Momox
+
+# Déclencheurs
+on:
+  schedule:
+    # Toutes les 5 minutes. Grâce à la rotation par lots, chaque exécution
+    # ne traite qu'un lot (BATCH_SIZE), donc reste courte. Toute la liste de
+    # 135 ISBN est couverte en ~6 exécutions (~30 min).
+    # (Note : GitHub peut retarder les exécutions planifiées de quelques min.)
+    - cron: "*/5 * * * *"
+  workflow_dispatch:   # permet de lancer manuellement depuis l'onglet Actions
+
+# Nécessaire pour que le workflow puisse réécrire state.json dans le dépôt
+permissions:
+  contents: write
+
+# Évite que deux exécutions se chevauchent
+concurrency:
+  group: momox-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lancer la surveillance
+        env:
+          # Seul le TOKEN reste un secret. Le chat ID est déjà dans le code.
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          PRICE_THRESHOLD: "7.0"
+          BATCH_SIZE: "25"
+        run: python momox_watch.py
+
+      - name: Sauvegarder l'état (state.json)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Mise à jour de l'état [skip ci]"
+          git push
