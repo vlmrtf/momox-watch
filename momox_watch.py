@@ -63,11 +63,35 @@ MOMOX_SEARCH_URL = (
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.5",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "Cache-Control": "max-age=0",
 }
+
+
+def make_session():
+    """Crée une session déguisée en navigateur et visite la page d'accueil
+    pour récupérer d'éventuels cookies (aide à passer certains blocages)."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    try:
+        s.get("https://www.momox-shop.fr/", timeout=30)
+        time.sleep(random.uniform(1.5, 3.0))
+    except Exception as e:
+        print(f"  [i] Préchauffage de la session échoué (on continue) : {e}")
+    return s
 
 
 # ----------------------------------------------------------------------------
@@ -95,11 +119,23 @@ def fetch_offer(session, isbn):
         return None, None
 
     url = MOMOX_SEARCH_URL.format(isbn=isbn)
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"    [!] Erreur requête pour {isbn} : {e}")
+    ref = {"Referer": "https://www.momox-shop.fr/"}
+    resp = None
+    for attempt in range(2):
+        try:
+            resp = session.get(url, headers=ref, timeout=30)
+            if resp.status_code == 403 and attempt == 0:
+                time.sleep(random.uniform(3.0, 6.0))
+                continue
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(random.uniform(3.0, 6.0))
+                continue
+            print(f"    [!] Erreur requete pour {isbn} : {e}")
+            return None, url
+    if resp is None:
         return None, url
 
     if DEBUG:
@@ -214,7 +250,7 @@ def main():
     if end > total:
         batch += all_isbns[: end - total]
 
-    session = requests.Session()
+    session = make_session()
     print(f"Liste : {total} ISBN — seuil = {THRESHOLD_EUR:.2f} €")
     print(f"Lot courant : indices {cursor}..{cursor + len(batch) - 1} "
           f"({len(batch)} ISBN)")
