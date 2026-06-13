@@ -4,16 +4,22 @@
 momox_watch.py
 --------------
 Surveille une liste d'ISBN sur momox-shop.fr et envoie une alerte Telegram
-dès qu'un titre est disponible à un prix inférieur au seuil (7 € par défaut).
+dès qu'un titre est DISPONIBLE (en stock) à un prix inférieur au seuil (7 €).
 
-Conçu pour tourner gratuitement et en permanence via GitHub Actions
-(aucun PC à laisser allumé). L'état est sauvegardé dans state.json pour
-éviter de renvoyer plusieurs fois la même alerte.
+Fonctionnement (validé sur les pages réelles de momox-shop.fr) :
+- On interroge la recherche du site avec l'ISBN.
+- momox identifie chaque produit par un code « M0 + ISBN sans le 978 »
+  (ex. ISBN 9782070335046  ->  code M02070335046).
+- La page contient, pour CE produit, ses variantes par état, chacune avec
+  son "stock" et son "price". momox affiche un prix même quand le stock est 0,
+  donc on ne retient que les variantes réellement en stock (stock > 0), et on
+  prend le prix le plus bas parmi celles-ci.
+
+Conçu pour GitHub Actions (rotation par lots, état dans state.json).
 
 Usage local :
-    python momox_watch.py            # exécution normale
-    python momox_watch.py --debug    # sauvegarde le HtML récupéré pour
-                                     # vérifier/ajuster les sélecteurs
+    python momox_watch.py
+    python momox_watch.py --debug   # enregistre le HTML récupéré
 """
 
 import json
@@ -25,7 +31,6 @@ import random
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 
 # ----------------------------------------------------------------------------
 # Configuration (modifiable via variables d'environnement / secrets GitHub)
@@ -35,29 +40,25 @@ ISBN_FILE = Path(os.environ.get("ISBN_FILE", "isbns.txt"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 
-# Chat ID inscrit directement ici (peu sensible). Reste modifiable via la
-# variable d'environnement TELEGRAM_CHAT_ID si besoin.
-# ⚠️ Ce numéro doit être TON identifiant donné par @getidsbot ("Your user ID"),
-# pas l'identifiant du bot. Le TOKEN, lui, reste un secret GitHub.
+# Chat ID inscrit directement ici (peu sensible). Modifiable via l'environnement.
+# Doit être TON identifiant (celui de @getidsbot / "Your user ID"). Le TOKEN, lui,
+# reste un secret GitHub.
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8881038521").strip()
 
 DEBUG = "--debug" in sys.argv
 
 # Délai (en secondes) entre deux requêtes vers Momox, pour rester discret.
-# Si tu vois des blocages (pages Cloudflare), augmente ces valeurs.
+# Si tu vois des blocages, augmente ces valeurs.
 MIN_DELAY, MAX_DELAY = 1.0, 2.0
 
-# Rotation par lots : à chaque exécution, on ne traite qu'un lot de BATCH_SIZE
-# ISBN, puis on avance dans la liste (curseur mémorisé dans state.json).
-# Avec 135 ISBN et un lot de 25, toute la liste est couverte en ~6 exécutions.
+# Rotation par lots : on ne traite qu'un lot de BATCH_SIZE ISBN par exécution,
+# puis on avance dans la liste (curseur mémorisé dans state.json).
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "25"))
 
-# --- Points à AJUSTER si Momox change sa structure (voir le README) ---------
-# URL de recherche par ISBN. {isbn} est remplacé par l'ISBN.
-MOMOX_SEARCH_URL = "https://www.momox-shop.fr/produkte-suchen/?searchType=&searchString={isbn}"
-# Sélecteur CSS du lien vers la fiche produit dans la page de résultats.
-PRODUCT_LINK_SELECTOR = "a.product-item-link, a[href*='-M']"
-# ----------------------------------------------------------------------------
+# Adresse de recherche de momox-shop.fr (l'ISBN est mis dans searchparam).
+MOMOX_SEARCH_URL = (
+    "https://www.momox-shop.fr/produits-C0/?fcIsSearch=1&searchparam={isbn}"
+)
 
 HEADERS = {
     "User-Agent": (
@@ -70,152 +71,68 @@ HEADERS = {
 
 
 # ----------------------------------------------------------------------------
-# Utilitaires de parsing
+# Correspondance ISBN -> code produit momox
 # ----------------------------------------------------------------------------
-def to_float(val):
-    """Convertit '6,99 €', '6.99', 6.99 -> 6.99 (ou None)."""
-    if val is None:
-        return None
-    s = str(val).replace("\xa0", " ").replace("€", "").strip()
-    s = s.replace(",", ".")
-    m = re.search(r"\d+(?:\.\d+)?", s)
-    return float(m.group()) if m else None
-
-
-def iter_jsonld(data):
-    """Parcourt récursivement une structure JSON-LD (gère @graph et imbrications)."""
-    if isinstance(data, dict):
-        if isinstance(data.get("@graph"), list):
-            for node in data["@graph"]:
-                yield from iter_jsonld(node)
-        yield data
-        for v in data.values():
-            if isinstance(v, (dict, list)):
-                yield from iter_jsonld(v)
-    elif isinstance(data, list):
-        for node in data:
-            yield from iter_jsonld(node)
-
-
-def extract_price_from_offers(node):
-    """Récupère le prix le plus bas d'un noeud schema.org Product/Offer."""
-    candidates = []
-
-    def collect(o):
-        if isinstance(o, dict):
-            for key in ("price", "lowPrice"):
-                if o.get(key) is not None:
-                    p = to_float(o[key])
-                    if p is not None:
-                        candidates.append(p)
-            if "offers" in o:
-                collect(o["offers"])
-        elif isinstance(o, list):
-            for x in o:
-                collect(x)
-
-    if node.get("offers") is not None:
-        collect(node["offers"])
-    if node.get("price") is not None:
-        p = to_float(node["price"])
-        if p is not None:
-            candidates.append(p)
-
-    return min(candidates) if candidates else None
-
-
-def parse_price_from_html(html):
-    """
-    Essaie plusieurs stratégies pour trouver le prix le plus bas disponible.
-    1) Données structurées JSON-LD (le plus fiable)
-    2) Balises meta (itemprop / og)
-    3) Repli regex sur un prix visible
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1) JSON-LD schema.org
-    for tag in soup.find_all("script", type="application/ld+json"):
-        raw = tag.string or tag.get_text() or ""
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        for node in iter_jsonld(data):
-            if isinstance(node, dict) and node.get("@type") in (
-                "Product", "Offer", "AggregateOffer",
-            ):
-                price = extract_price_from_offers(node)
-                if price is not None:
-                    return price
-
-    # 2) Balises meta classiques
-    for attrs in (
-        {"property": "product:price:amount"},
-        {"itemprop": "price"},
-        {"property": "og:price:amount"},
-    ):
-        meta = soup.find("meta", attrs=attrs)
-        if meta and meta.get("content"):
-            p = to_float(meta["content"])
-            if p is not None:
-                return p
-
-    # 3) Repli : premier motif "X,XX €" trouvé dans la page
-    m = re.search(r"(\d{1,3}[.,]\d{2})\s*€", soup.get_text(" "))
-    if m:
-        return to_float(m.group(1))
-
+def isbn_to_mid(isbn):
+    """9782070335046 -> 'M02070335046' (M0 + ISBN sans le préfixe 978/979)."""
+    isbn = re.sub(r"[^0-9X]", "", isbn.upper())
+    if len(isbn) == 13 and isbn[:3] in ("978", "979"):
+        return "M0" + isbn[3:]
     return None
 
 
 # ----------------------------------------------------------------------------
-# Récupération d'une offre pour un ISBN
+# Récupération de l'offre disponible la moins chère pour un ISBN
 # ----------------------------------------------------------------------------
 def fetch_offer(session, isbn):
     """
-    Renvoie le prix le plus bas disponible pour l'ISBN sur momox-shop.fr,
-    ou None si introuvable / indisponible.
+    Renvoie (prix, url) où prix = prix le plus bas EN STOCK pour l'ISBN,
+    ou (None, url) si rien n'est disponible / produit introuvable.
     """
-    search_url = MOMOX_SEARCH_URL.format(isbn=isbn)
+    mid = isbn_to_mid(isbn)
+    if not mid:
+        print(f"    [!] Format d'ISBN inattendu, ignoré : {isbn}")
+        return None, None
+
+    url = MOMOX_SEARCH_URL.format(isbn=isbn)
     try:
-        resp = session.get(search_url, headers=HEADERS, timeout=30)
+        resp = session.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
     except Exception as e:
-        print(f"  [!] Erreur requête recherche pour {isbn} : {e}")
-        return None
+        print(f"    [!] Erreur requête pour {isbn} : {e}")
+        return None, url
 
     if DEBUG:
-        Path(f"debug_search_{isbn}.html").write_text(resp.text, encoding="utf-8")
-        print(f"  [debug] HTML de recherche écrit dans debug_search_{isbn}.html")
+        Path(f"debug_{isbn}.html").write_text(resp.text, encoding="utf-8")
 
-    # La page de recherche contient parfois déjà le prix (JSON-LD).
-    price = parse_price_from_html(resp.text)
-    if price is not None:
-        return price
+    # Les données sont du JSON « échappé » dans la page ; on retire les
+    # antislashs pour pouvoir lire proprement les variantes du bon produit.
+    clean = resp.text.replace("\\", "")
+    pattern = (
+        r'"id":"' + re.escape(mid) +
+        r'[^"]*","type":"([^"]*)","stock":\s*(\d+),\s*"price":\s*([0-9.]+)'
+    )
+    variants = re.findall(pattern, clean)
 
-    # Sinon, on suit le lien vers la fiche produit puis on relit le prix.
-    soup = BeautifulSoup(resp.text, "html.parser")
-    link = soup.select_one(PRODUCT_LINK_SELECTOR)
-    if not link or not link.get("href"):
-        return None
+    # Lien direct vers la fiche produit (pour l'alerte), sinon l'URL de recherche.
+    m = re.search(r'href="(/[^"]*' + re.escape(mid) + r'\.html)"', resp.text)
+    product_url = ("https://www.momox-shop.fr" + m.group(1)) if m else url
 
-    href = link["href"]
-    if href.startswith("/"):
-        href = "https://www.momox-shop.fr" + href
+    if not variants:
+        print(f"    introuvable dans la recherche (probablement jamais listé)")
+        return None, product_url
 
-    time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-    try:
-        resp2 = session.get(href, headers=HEADERS, timeout=30)
-        resp2.raise_for_status()
-    except Exception as e:
-        print(f"  [!] Erreur requête fiche pour {isbn} : {e}")
-        return None
-
-    if DEBUG:
-        Path(f"debug_product_{isbn}.html").write_text(resp2.text, encoding="utf-8")
-        print(f"  [debug] HTML de fiche écrit dans debug_product_{isbn}.html")
-
-    return parse_price_from_html(resp2.text)
+    # Variantes réellement en stock
+    in_stock = [(float(p), typ) for typ, s, p in variants if int(s) > 0]
+    nb_total = len(set(variants))
+    if in_stock:
+        best_price = min(p for p, _ in in_stock)
+        print(f"    EN STOCK : {best_price:.2f} € "
+              f"({len(set(in_stock))} variante(s) dispo sur {nb_total})")
+        return best_price, product_url
+    else:
+        print(f"    pas en stock ({nb_total} variante(s) listée(s), aucune dispo)")
+        return None, product_url
 
 
 # ----------------------------------------------------------------------------
@@ -227,9 +144,9 @@ def send_telegram(text):
               "alerte non envoyée (affichage console).")
         print("  >>>", text)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
+        r = requests.post(api, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
@@ -241,13 +158,9 @@ def send_telegram(text):
 
 
 # ----------------------------------------------------------------------------
-# État
+# État (curseur de rotation + suivi par ISBN)
 # ----------------------------------------------------------------------------
 def load_state():
-    """
-    État au format {"cursor": int, "items": {isbn: {"alerted_price": ...}}}.
-    Migre automatiquement un ancien état plat ou vide.
-    """
     if STATE_FILE.exists():
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -255,7 +168,6 @@ def load_state():
                 if "items" in data and isinstance(data["items"], dict):
                     data.setdefault("cursor", 0)
                     return data
-                # Ancien format plat {isbn: {...}} -> migration
                 items = {k: v for k, v in data.items() if k != "cursor"}
                 return {"cursor": data.get("cursor", 0), "items": items}
         except Exception:
@@ -282,7 +194,7 @@ def load_isbns():
 
 
 # ----------------------------------------------------------------------------
-# Programme principal
+# Programme principal (rotation par lots)
 # ----------------------------------------------------------------------------
 def main():
     all_isbns = load_isbns()
@@ -294,16 +206,13 @@ def main():
     items = state["items"]
     total = len(all_isbns)
 
-    # Curseur de rotation : où reprendre dans la liste.
     cursor = state.get("cursor", 0)
     if cursor >= total:
         cursor = 0
-
-    # Lot courant (avec retour au début si on déborde de la fin).
     end = cursor + BATCH_SIZE
     batch = all_isbns[cursor:end]
     if end > total:
-        batch += all_isbns[: end - total]  # complète en repartant du début
+        batch += all_isbns[: end - total]
 
     session = requests.Session()
     print(f"Liste : {total} ISBN — seuil = {THRESHOLD_EUR:.2f} €")
@@ -312,20 +221,16 @@ def main():
 
     for i, isbn in enumerate(batch, 1):
         print(f"[{i}/{len(batch)}] ISBN {isbn} ...")
-        price = fetch_offer(session, isbn)
+        price, url = fetch_offer(session, isbn)
         prev_alerted = items.get(isbn, {}).get("alerted_price")
 
-        if price is not None:
-            print(f"    prix trouvé : {price:.2f} €")
-
         if price is not None and price < THRESHOLD_EUR:
-            # On alerte si on n'avait jamais alerté, ou si le prix a baissé.
             if prev_alerted is None or price < prev_alerted:
                 msg = (
-                    f"📚 <b>Nouvelle offre Momox</b>\n"
+                    f"📚 <b>Dispo sur Momox sous {THRESHOLD_EUR:.0f} €</b>\n"
+                    f"Prix : <b>{price:.2f} €</b>\n"
                     f"ISBN : <code>{isbn}</code>\n"
-                    f"Prix : <b>{price:.2f} €</b> (seuil {THRESHOLD_EUR:.2f} €)\n"
-                    f"🔗 {MOMOX_SEARCH_URL.format(isbn=isbn)}"
+                    f"🔗 {url}"
                 )
                 send_telegram(msg)
                 print("    → alerte envoyée ✅")
@@ -333,14 +238,12 @@ def main():
                 print("    (déjà signalé à ce prix, pas de nouvelle alerte)")
             items[isbn] = {"alerted_price": price}
         else:
-            # Plus dispo ou au-dessus du seuil : on réarme pour une future baisse.
+            # Indisponible ou au-dessus du seuil : on réarme pour une future baisse.
             items[isbn] = {"alerted_price": None}
 
-        # Pause polie entre deux ISBN (sauf le dernier du lot).
         if i < len(batch):
             time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
-    # Avance le curseur pour le prochain lot (retour à 0 en fin de liste).
     state["cursor"] = (cursor + BATCH_SIZE) % total
     state["items"] = items
     save_state(state)
